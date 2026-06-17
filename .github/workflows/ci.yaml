@@ -63,4 +63,7 @@ jobs:
         with:
           path: node_modules
           key: node-modules-${{ hashFiles('package-lock.json') }}
+      - name: Check restored prettier modules
+        run: |
+          node -e "for (const moduleName of ['prettier', 'eslint-plugin-prettier', 'eslint-config-prettier']) console.log(`${moduleName}: ${require.resolve(moduleName)}`)"
       - run: npm run build
