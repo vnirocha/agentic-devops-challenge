@@ -9,6 +9,9 @@ on:
     branches:
       - main
 
+env:
+  REACT_APP_API_URL: https://api.rdicidr.com
+
 jobs:
   install:
     runs-on: ubuntu-latest
