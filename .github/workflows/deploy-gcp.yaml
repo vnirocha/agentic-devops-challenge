@@ -1,0 +1,105 @@
+name: Deploy to GCP
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy. Defaults to the commit SHA.
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GAR_LOCATION: ${{ vars.GAR_LOCATION }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'rdicidr' }}
+  GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+  GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'production' }}
+  K8S_WORKLOAD: ${{ vars.K8S_WORKLOAD || 'statefulset/rdicidr' }}
+  K8S_CONTAINER: ${{ vars.K8S_CONTAINER || 'rdicidr' }}
+
+jobs:
+  create-environment:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "GitHub Environment 'production' is ready for deployment variables."
+
+  deploy:
+    needs: create-environment
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate configuration
+        run: |
+          missing=0
+          for name in GCP_PROJECT_ID GAR_LOCATION GAR_REPOSITORY GKE_CLUSTER GKE_LOCATION; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required GitHub Actions variable: ${name}"
+              missing=1
+            fi
+          done
+          if [ -z "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ]; then
+            echo "::error::Missing required GitHub Actions variable: GCP_WORKLOAD_IDENTITY_PROVIDER"
+            missing=1
+          fi
+          if [ -z "${{ vars.GCP_SERVICE_ACCOUNT }}" ]; then
+            echo "::error::Missing required GitHub Actions variable: GCP_SERVICE_ACCOUNT"
+            missing=1
+          fi
+          exit "${missing}"
+
+      - name: Resolve image tag
+        id: image
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
+
+      - name: Build image
+        run: |
+          docker build \
+            --tag "${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}" \
+            --tag "${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:latest" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+          docker push "${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:latest"
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_LOCATION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Deploy image
+        run: |
+          kubectl -n "${K8S_NAMESPACE}" set image "${K8S_WORKLOAD}" \
+            "${K8S_CONTAINER}=${GAR_LOCATION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${IMAGE_NAME}:${{ steps.image.outputs.tag }}"
+          kubectl -n "${K8S_NAMESPACE}" rollout status "${K8S_WORKLOAD}" --timeout=180s
